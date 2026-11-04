@@ -1,2 +1,4 @@
+chromadb==1.5.9
 ddgs==9.16.1
+pypdf==6.21.4
 trafilatura==2.3.1
