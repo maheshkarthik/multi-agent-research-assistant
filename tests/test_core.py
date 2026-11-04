@@ -128,3 +128,8 @@ class ReportFormattingTests(unittest.TestCase):
         self.assertIn("[Page (2024)](https://a.example/x_%28y%29) · Web", source_line(self.sources[0]))
         self.assertEqual(slugify("How did the printing press change science?"), "how-did-the-printing-press-change-science")
         self.assertEqual(slugify("???"), "research")
+
+    def test_headings_are_demoted(self):
+        from src.report import demote_headings
+
+        self.assertEqual(demote_headings("## Causes\ntext ## not a heading\n##### Deep"), "#### Causes\ntext ## not a heading\n###### Deep")

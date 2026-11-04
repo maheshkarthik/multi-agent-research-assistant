@@ -29,7 +29,7 @@ from src.orchestrator import (
     ResearchResult,
     ResearchRun,
 )
-from src.report import KIND_LABELS, link_citations, slugify, source_line
+from src.report import KIND_LABELS, demote_headings, link_citations, slugify, source_line
 from src.tools import make_tools
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
@@ -150,7 +150,7 @@ class ProgressView:
             plan = data["plan"]
             self.plan_step.update(label=f"Planner: {len(plan.sub_questions)} sub-questions", state="complete")
             self.plan_step.markdown("\n".join(f"{sq.number}. {sq.text}" for sq in plan.sub_questions))
-            self.box.update(label=":shimmer[Researching]")
+            self.box.update(label=":shimmer[Researching]", expanded=True)
             for sq in plan.sub_questions:
                 self.steps[sq.number] = self.box.status(f":shimmer[Researcher {sq.number}: searching]", type="step")
         elif event.kind == SOURCES_FOUND:
@@ -165,7 +165,7 @@ class ProgressView:
             label = f"Researcher {sq.number}: " + ("failed" if failed else f"{len(findings.findings)} findings")
             self.steps[sq.number].update(label=label, state="error" if failed else "complete")
         elif event.kind == WRITING:
-            self.box.update(label=":shimmer[Writing the report]")
+            self.box.update(label=":shimmer[Writing the report]", expanded=True)
             self.writing_step = self.box.status(":shimmer[Writer: drafting the report]", type="step")
         elif event.kind == WARNING:
             self.warnings.append(event.message)
@@ -215,7 +215,7 @@ if submitted:
 result: ResearchResult | None = st.session_state.result
 if result is not None:
     st.subheader(result.question)
-    st.markdown(link_citations(result.report, result.sources))
+    st.markdown(demote_headings(link_citations(result.report, result.sources)))
 
     check = result.citations
     if check.unknown_ids:

@@ -32,6 +32,18 @@ def link_citations(report: str, sources: list[Source]) -> str:
     return _CITATION_GROUP.sub(replace, report)
 
 
+def demote_headings(markdown: str, levels: int = 2) -> str:
+    """Make every Markdown heading ``levels`` smaller (## becomes ####), up to h6.
+
+    In the app the question is shown as a subheading, so the writer's ## section
+    headings would otherwise render larger than the report's own title.
+    """
+    def replace(match: re.Match[str]) -> str:
+        return "#" * min(6, len(match.group(1)) + levels) + " "
+
+    return re.sub(r"^(#{1,6})\s+", replace, markdown, flags=re.MULTILINE)
+
+
 def source_line(source: Source) -> str:
     """One Markdown line for the source list."""
     label = KIND_LABELS.get(source.kind, source.kind)
