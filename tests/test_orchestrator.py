@@ -8,6 +8,7 @@ from src.orchestrator import (
     NO_FINDINGS_REPORT,
     PLAN_READY,
     RESEARCHER_DONE,
+    SEARCHING,
     SOURCES_FOUND,
     WARNING,
     WRITING,
@@ -40,6 +41,23 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(kinds.count(SOURCES_FOUND), 2)
         self.assertEqual(kinds.count(RESEARCHER_DONE), 2)
         self.assertEqual(kinds[-2:], [WRITING, DONE])
+
+    def test_events_are_emitted_on_the_calling_thread_in_order(self):
+        import threading
+
+        llm = FakeLLM(planner=plan_reply("First?", "Second?"), researcher=cite_all_researcher, writer="Report [1].")
+        result, events = run(llm, [FakeTool("web"), FakeTool("broken", ToolError("down"))])
+        kinds = [e.kind for e in events]
+        self.assertEqual(kinds[:3], [PLAN_READY, SEARCHING, SEARCHING])
+        self.assertEqual(kinds[3:6], [WARNING, SOURCES_FOUND, RESEARCHER_DONE])  # sub-question 1, its warning first
+        self.assertEqual([s.id for s in result.findings[0].sources], [1])  # numbered in sub-question order
+        self.assertEqual([s.id for s in result.findings[1].sources], [2])
+
+        seen = []
+        handler = lambda event: seen.append(threading.current_thread())
+        ResearchRun(FakeLLM(planner=plan_reply("A?", "B?"), researcher=cite_all_researcher, writer="R [1]."),
+                    [FakeTool("web")], depth=2, on_event=handler).run("Q?")
+        self.assertEqual(set(seen), {threading.current_thread()})
 
     def test_markdown_lists_only_cited_sources(self):
         llm = FakeLLM(planner=plan_reply("First?", "Second?"), researcher=cite_all_researcher,

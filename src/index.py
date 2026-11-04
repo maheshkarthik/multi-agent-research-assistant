@@ -10,39 +10,49 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from src.local_docs import db_dir
+
+if TYPE_CHECKING:
+    from src.local_docs.document_processor import PdfSource
+    from src.local_docs.vector_store import VectorStore
 
 SAMPLES_DIR = Path("data/samples")
 
 
 def index_pdfs(paths: list[Path], reindex: bool = False, persist_directory: Path | None = None) -> list[str]:
     """Index every PDF in ``paths`` (files or folders). Returns one status line per file."""
-    from src.local_docs.document_processor import DocumentProcessor
     from src.local_docs.vector_store import VectorStore
 
     store = VectorStore(persist_directory=persist_directory or db_dir())
-    processor = DocumentProcessor()
-    existing = {doc.source for doc in store.list_documents()}
-
     pdfs: list[Path] = []
     for path in paths:
         pdfs += sorted(path.glob("*.pdf")) if path.is_dir() else [path]
+    return [index_document(store, str(pdf), pdf.name, reindex=reindex) for pdf in pdfs]
 
-    lines = []
-    for pdf in pdfs:
-        if pdf.name in existing and not reindex:
-            lines.append(f"{pdf.name}: already indexed, skipped")
-            continue
-        document = processor.process_pdf(str(pdf))
-        if document.is_empty:
-            lines.append(f"{pdf.name}: no extractable text (scanned PDF?), skipped")
-            continue
-        if reindex and pdf.name in existing:
-            store.delete_document(pdf.name)
-        stored = store.add_documents(document.chunks)
-        lines.append(f"{pdf.name}: {document.page_count} pages, {stored} chunks")
-    return lines
+
+def index_document(store: "VectorStore", source: "PdfSource", name: str, reindex: bool = False) -> str:
+    """Add one PDF (a path, bytes or file object) to ``store``. Returns a status line.
+
+    Documents already in the index are skipped unless ``reindex`` is True, in
+    which case the old chunks are replaced.
+    """
+    from src.local_docs.document_processor import DocumentProcessingError, DocumentProcessor
+
+    existing = {doc.source for doc in store.list_documents()}
+    if name in existing and not reindex:
+        return f"{name}: already indexed, skipped"
+    try:
+        document = DocumentProcessor().process_pdf(source, source_name=name)
+    except DocumentProcessingError as exc:
+        return f"{name}: could not be read ({exc})"
+    if document.is_empty:
+        return f"{name}: no extractable text (scanned PDF?), skipped"
+    if name in existing:
+        store.delete_document(name)
+    stored = store.add_documents(document.chunks)
+    return f"{name}: {document.page_count} pages, {stored} chunks"
 
 
 def main(argv: list[str] | None = None) -> int:

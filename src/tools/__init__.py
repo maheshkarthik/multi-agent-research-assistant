@@ -26,11 +26,12 @@ class ResearchTool(Protocol):
 SOURCE_CHOICES = ("both", "web", "local")
 
 
-def make_tools(sources: str = "both") -> tuple[list[ResearchTool], list[str]]:
+def make_tools(sources: str = "both", store: object | None = None) -> tuple[list[ResearchTool], list[str]]:
     """Build the tools for a source setting: "web", "local" or "both".
 
     Returns the tools and any setup warnings, such as an empty local index.
-    Imports are lazy so web-only runs never load ChromaDB.
+    Imports are lazy so web-only runs never load ChromaDB. Pass ``store`` to
+    reuse an open VectorStore instead of opening the default index.
     """
     if sources not in SOURCE_CHOICES:
         raise ValueError(f"sources must be one of {', '.join(SOURCE_CHOICES)}")
@@ -46,7 +47,8 @@ def make_tools(sources: str = "both") -> tuple[list[ResearchTool], list[str]]:
         from src.local_docs.vector_store import VectorStore
         from src.tools.local import LocalDocsTool
 
-        store = VectorStore(persist_directory=db_dir())
+        if store is None:
+            store = VectorStore(persist_directory=db_dir())
         if store.count() == 0:
             warnings.append("No local documents are indexed yet. Run: python -m src.index (indexes data/samples)")
             if sources == "local":

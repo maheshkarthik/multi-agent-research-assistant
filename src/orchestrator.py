@@ -10,6 +10,11 @@ Evidence gathering is network-bound, so all sub-questions are searched at once.
 Model calls run one after another because a local Ollama on an 8 GB machine
 serves one request at a time. Progress is reported through ``on_event`` so the
 command line and the UI can show what each agent is doing.
+
+All events are emitted on the thread that called ``run()``, never on a search
+thread, so UI frameworks that only allow updates from their own thread (such as
+Streamlit) can render them directly. Sources are numbered on that thread too, in
+sub-question order, so numbering is the same from run to run.
 """
 
 from __future__ import annotations
@@ -131,6 +136,8 @@ class ResearchRun:
         with ThreadPoolExecutor(max_workers=GATHER_WORKERS) as pool:
             futures = {sq.number: pool.submit(self._gather, sq) for sq in plan.sub_questions}
             for sq in plan.sub_questions:
+                self._emit(SEARCHING, f"Searching for sub-question {sq.number}", sub_question=sq)
+            for sq in plan.sub_questions:
                 all_findings.append(self._research(researcher, sq, futures[sq.number]))
 
         if any(f.findings for f in all_findings):
@@ -166,19 +173,22 @@ class ResearchRun:
 
     # -------------------------------------------------------------- steps
 
-    def _gather(self, sq: SubQuestion) -> list[Source]:
-        """Run every tool for one sub-question and register up to max_sources sources."""
-        self._emit(SEARCHING, f"Searching for sub-question {sq.number}", sub_question=sq)
+    def _gather(self, sq: SubQuestion) -> tuple[list[list[Evidence]], list[str]]:
+        """Run every tool for one sub-question. Runs on a search thread, so it doesn't emit events."""
         per_tool: list[list[Evidence]] = []
+        warnings: list[str] = []
         for tool in self.tools:
             try:
                 per_tool.append(tool.gather(sq.text, sq.queries))
             except ToolError as exc:
-                self._warn(f"{tool.name} search failed for sub-question {sq.number}: {exc}")
+                warnings.append(f"{tool.name} search failed for sub-question {sq.number}: {exc}")
             except Exception as exc:  # a broken tool must not stop the whole run
                 logger.exception("Unexpected error in tool %s", tool.name)
-                self._warn(f"{tool.name} search failed for sub-question {sq.number}: {exc}")
+                warnings.append(f"{tool.name} search failed for sub-question {sq.number}: {exc}")
+        return per_tool, warnings
 
+    def _register(self, per_tool: list[list[Evidence]]) -> list[Source]:
+        """Number up to max_sources sources, taking results from each tool in turn."""
         unique: list[Source] = []
         for evidence in _interleave(per_tool):
             if len(unique) == self.max_sources:
@@ -186,11 +196,14 @@ class ResearchRun:
             source = self.registry.register(evidence)  # same URL from another sub-question keeps its number
             if source not in unique:
                 unique.append(source)
-        self._emit(SOURCES_FOUND, f"Sub-question {sq.number}: {len(unique)} sources", sub_question=sq, sources=unique)
         return unique
 
     def _research(self, researcher: Researcher, sq: SubQuestion, gathered: Future) -> Findings:
-        sources = gathered.result()  # _gather never raises
+        per_tool, warnings = gathered.result()  # _gather never raises
+        for warning in warnings:
+            self._warn(warning)
+        sources = self._register(per_tool)
+        self._emit(SOURCES_FOUND, f"Sub-question {sq.number}: {len(sources)} sources", sub_question=sq, sources=sources)
         try:
             findings = researcher.run(sq, sources)
         except LLMConnectionError:

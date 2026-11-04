@@ -95,3 +95,36 @@ class CitationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReportFormattingTests(unittest.TestCase):
+    def setUp(self):
+        from src.sources import Source
+
+        self.sources = [
+            Source(1, "web", "Page (2024)", "https://a.example/x_(y)", "t"),
+            Source(2, "local", "guide.pdf, page 3", "guide.pdf, page 3", "t"),
+        ]
+
+    def test_web_citations_become_links_and_local_stay_plain(self):
+        from src.report import link_citations
+
+        linked = link_citations("Fact [1]. Local [2]. Both [1, 2]. Unknown [9].", self.sources)
+        self.assertEqual(
+            linked,
+            "Fact [[1]](https://a.example/x_%28y%29). Local [2]. Both [[1]](https://a.example/x_%28y%29)[2]. Unknown [9].",
+        )
+
+    def test_already_linked_citations_are_untouched(self):
+        from src.report import link_citations
+
+        text = "See [[1]](https://a.example)."
+        self.assertEqual(link_citations(text, self.sources), text)
+
+    def test_source_lines_and_slug(self):
+        from src.report import slugify, source_line
+
+        self.assertEqual(source_line(self.sources[1]), "**[2]** guide.pdf, page 3 · Local PDF")
+        self.assertIn("[Page (2024)](https://a.example/x_%28y%29) · Web", source_line(self.sources[0]))
+        self.assertEqual(slugify("How did the printing press change science?"), "how-did-the-printing-press-change-science")
+        self.assertEqual(slugify("???"), "research")
