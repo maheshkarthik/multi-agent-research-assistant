@@ -124,6 +124,13 @@ class FailureTests(unittest.TestCase):
             result = ResearchRun(llm, [FakeTool("web")], depth=2, on_event=handler).run("Q?")
         self.assertEqual(result.report, "Report [1].")
 
+    def test_unclear_question_stops_before_any_search(self):
+        tool = FakeTool("web")
+        llm = FakeLLM(planner={"is_research_question": False, "reason": "gibberish", "sub_questions": []})
+        with self.assertRaises(ValueError):
+            run(llm, [tool])
+        self.assertEqual(tool.calls, [])
+
     def test_empty_question_and_no_tools_are_rejected(self):
         with self.assertRaises(ValueError):
             ResearchRun(FakeLLM(), [FakeTool()]).run("   ")

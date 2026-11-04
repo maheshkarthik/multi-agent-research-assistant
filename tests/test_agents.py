@@ -2,7 +2,7 @@
 
 import unittest
 
-from src.agents import MAX_DEPTH, Findings, Finding, Planner, Researcher, SubQuestion, Writer
+from src.agents import MAX_DEPTH, Findings, Finding, Planner, Researcher, SubQuestion, UnclearQuestionError, Writer
 from src.llm import LLMError
 from src.sources import Source
 from tests.fakes import FakeLLM, plan_reply
@@ -38,13 +38,41 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(plan.sub_questions[0].queries, ["Same?"])
         self.assertEqual(plan.sub_questions[1].queries, ["a", "b"])  # capped at 2
 
+    def test_retries_once_after_malformed_output(self):
+        replies = iter([LLMError("malformed"), plan_reply("One?", "Two?")])
+
+        def planner(system, user):
+            reply = next(replies)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        llm = FakeLLM(planner=planner)
+        with self.assertLogs("src.agents", level="WARNING"):
+            plan = Planner(llm).run("Q?", depth=2)
+        self.assertFalse(plan.fallback)
+        self.assertEqual(len(llm.calls), 2)
+
     def test_falls_back_to_original_question_when_model_fails(self):
-        plan = Planner(FakeLLM(planner=LLMError("bad"))).run("Original question?")
+        llm = FakeLLM(planner=LLMError("bad"))
+        with self.assertLogs("src.agents", level="WARNING"):
+            plan = Planner(llm).run("Original question?")
+        self.assertEqual(len(llm.calls), 2)  # one retry, then give up
         self.assertTrue(plan.fallback)
         self.assertEqual([sq.text for sq in plan.sub_questions], ["Original question?"])
 
+    def test_rejects_input_the_model_judges_is_not_a_question(self):
+        llm = FakeLLM(planner={"is_research_question": False, "reason": "placeholder text", "sub_questions": []})
+        with self.assertRaisesRegex(UnclearQuestionError, "placeholder text"):
+            Planner(llm).run("Your question here")
+
+    def test_missing_judgement_is_treated_as_a_real_question(self):
+        llm = FakeLLM(planner=plan_reply("One?", "Two?"))  # no is_research_question key
+        self.assertEqual(len(Planner(llm).run("Q?", depth=2).sub_questions), 2)
+
     def test_falls_back_when_model_returns_nothing_usable(self):
-        self.assertTrue(Planner(FakeLLM(planner={"sub_questions": []})).run("Q?").fallback)
+        with self.assertLogs("src.agents", level="WARNING"):
+            self.assertTrue(Planner(FakeLLM(planner={"sub_questions": []})).run("Q?").fallback)
 
 
 class ResearcherTests(unittest.TestCase):

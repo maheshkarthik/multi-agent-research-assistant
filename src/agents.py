@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 MIN_DEPTH, MAX_DEPTH = 2, 5
 MAX_QUERIES_PER_QUESTION = 2
+PLANNER_ATTEMPTS = 2
 MAX_FINDINGS = 6
 WRITER_NUM_CTX = 8192
 
@@ -62,7 +63,10 @@ class Findings:
 # ---------------------------------------------------------------- planner
 
 PLANNER_SYSTEM = """You are the planning agent of a research team.
-Break the user's research question into exactly {depth} focused sub-questions that together answer it.
+First decide whether the input is a real research question with a clear topic.
+If it is placeholder text (such as "your question here"), a greeting, gibberish, or has no clear topic,
+set "is_research_question" to false, explain why in "reason", and return no sub-questions. Never invent a topic.
+Otherwise, break the research question into exactly {depth} focused sub-questions that together answer it.
 Rules:
 - Each sub-question covers a different aspect; together they cover the whole question.
 - Each sub-question must be answerable by searching the web or documents.
@@ -73,6 +77,8 @@ Rules:
 PLAN_SCHEMA = {
     "type": "object",
     "properties": {
+        "is_research_question": {"type": "boolean"},
+        "reason": {"type": "string"},
         "sub_questions": {
             "type": "array",
             "items": {
@@ -85,8 +91,12 @@ PLAN_SCHEMA = {
             },
         }
     },
-    "required": ["sub_questions"],
+    "required": ["is_research_question", "reason", "sub_questions"],
 }
+
+
+class UnclearQuestionError(ValueError):
+    """The input is not a research question the agents can work on."""
 
 
 class Planner:
@@ -98,16 +108,31 @@ class Planner:
 
         If the model fails or returns nothing usable, falls back to researching
         the original question directly, so a run can still complete.
+
+        Raises:
+            UnclearQuestionError: If the model judges the input is not a research
+                question, for example placeholder text. Researching it anyway
+                would make the agents invent a topic.
         """
         depth = max(MIN_DEPTH, min(MAX_DEPTH, depth))
-        try:
-            data = self.llm.generate_json(
-                PLANNER_SYSTEM.format(depth=depth), f"Research question: {question}", schema=PLAN_SCHEMA
-            )
+        sub_questions: list[SubQuestion] = []
+        for attempt in range(1, PLANNER_ATTEMPTS + 1):  # small models occasionally return malformed JSON
+            try:
+                data = self.llm.generate_json(
+                    PLANNER_SYSTEM.format(depth=depth), f"Research question: {question}", schema=PLAN_SCHEMA
+                )
+            except LLMError as exc:
+                logger.warning("Planner attempt %d failed: %s", attempt, exc)
+                continue
+            if data.get("is_research_question") is False:
+                reason = str(data.get("reason", "")).strip() or "it has no clear topic"
+                raise UnclearQuestionError(
+                    f"That doesn't look like a research question ({reason}). Please ask a specific question."
+                )
             sub_questions = _parse_sub_questions(data, depth)
-        except LLMError as exc:
-            logger.warning("Planner failed, researching the question directly: %s", exc)
-            sub_questions = []
+            if sub_questions:
+                break
+            logger.warning("Planner attempt %d returned no usable sub-questions", attempt)
         if not sub_questions:
             return Plan(question, [SubQuestion(1, question, [question])], fallback=True)
         return Plan(question, sub_questions)
