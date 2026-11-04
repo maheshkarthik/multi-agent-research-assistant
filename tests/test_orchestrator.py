@@ -142,7 +142,7 @@ class FailureTests(unittest.TestCase):
             run(llm, [FakeTool("web")])
 
     def test_invented_citation_in_report_is_warned(self):
-        llm = FakeLLM(planner=plan_reply("First?", "Second?"), researcher=cite_all_researcher, writer="Claim [42].")
+        llm = FakeLLM(planner=plan_reply("First?", "Second?"), researcher=cite_all_researcher, writer="Claim [1][42].")
         result, _ = run(llm, [FakeTool("web")])
         self.assertEqual(result.citations.unknown_ids, [42])
         self.assertTrue(any("don't exist" in w for w in result.warnings))

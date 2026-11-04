@@ -202,6 +202,11 @@ class WriterTests(unittest.TestCase):
         with self.assertRaises(LLMError):
             Writer(llm).run("Main?", [Findings(SubQuestion(1, "Why?", []), [Finding("B.", [1])])])
 
+    def test_report_without_valid_citations_is_an_error(self):
+        reply = {"summary": "2 to 3 sentences that directly answer the question", "sections": [], "conclusion": ""}
+        with self.assertRaises(LLMError):
+            Writer(FakeLLM(writer=reply)).run("Main?", [Findings(SubQuestion(1, "Why?", []), [Finding("B.", [1])])])
+
     def test_conflicts_and_follow_ups_are_labelled(self):
         llm = FakeLLM(writer="Report [1].")
         findings = [Findings(SubQuestion(3, "Why?", [], follow_up=True), [Finding("Because.", [1])])]

@@ -12,6 +12,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 
+from src.citations import cited_ids
 from src.llm import LLM, LLMError
 from src.sources import Source
 
@@ -22,6 +23,8 @@ _NUMBER = re.compile(r"\d+(?:\.\d+)?")
 MIN_DEPTH, MAX_DEPTH = 2, 5
 MAX_QUERIES_PER_QUESTION = 2
 PLANNER_ATTEMPTS = 2
+# Every schema sets minLength on its strings: without it, qwen3 sometimes fills
+# every field with "" (seen in 2 of 6 evaluation runs for the planner).
 MAX_FINDINGS = 6
 MAX_FOLLOW_UPS = 2
 CONFLICTS_MAX_TOKENS = 1500  # the topic grouping makes this reply longer than the others
@@ -90,8 +93,8 @@ PLAN_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "question": {"type": "string"},
-                    "search_queries": {"type": "array", "items": {"type": "string"}},
+                    "question": {"type": "string", "minLength": 10},
+                    "search_queries": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 3}},
                 },
                 "required": ["question", "search_queries"],
             },
@@ -180,7 +183,7 @@ FINDINGS_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "claim": {"type": "string"},
+                    "claim": {"type": "string", "minLength": 10},
                     "source_ids": {"type": "array", "items": {"type": "integer"}},
                 },
                 "required": ["claim", "source_ids"],
@@ -263,8 +266,8 @@ REVIEW_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "question": {"type": "string"},
-                    "search_queries": {"type": "array", "items": {"type": "string"}},
+                    "question": {"type": "string", "minLength": 10},
+                    "search_queries": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 3}},
                 },
                 "required": ["question", "search_queries"],
             },
@@ -380,9 +383,9 @@ WRITER_SYSTEM = """You are the writing agent of a research team. Write a researc
 Rules:
 - End every sentence that states a fact with the source numbers from the findings in square brackets, for example [2] or [1][4].
 - Only use source numbers that appear in the findings. Never invent sources or facts.
-- "summary": 2 to 3 sentences that directly answer the question.
-- "sections": one per sub-question, each with a short descriptive heading (not "Sub-question 1") and a body of one or two paragraphs. Findings under a "Follow-up" heading fill gaps: put them in the section they belong to.
-- "conclusion": 2 to 3 sentences.
+- Begin with a summary of two or three sentences that directly answers the question.
+- Then write one section per sub-question. Give each a short heading that names its topic (never "Sub-question 1") and a body of one or two paragraphs. Findings under a "Follow-up" heading fill gaps: put them in the section they belong to.
+- Finish with a conclusion of two or three sentences.
 - If conflicts between sources are listed, state each one plainly in the relevant section, citing both sources. Do not merge conflicting facts into a range or pick one silently.
 - If something could not be found, say briefly that the sources do not cover it.
 - Write about the topic only. Never mention the findings, sub-questions, reviewer or research process.
@@ -393,12 +396,12 @@ Rules:
 REPORT_SCHEMA = {
     "type": "object",
     "properties": {
-        "summary": {"type": "string"},
+        "summary": {"type": "string", "minLength": 20},
         "sections": {
             "type": "array",
             "items": {
                 "type": "object",
-                "properties": {"heading": {"type": "string"}, "body": {"type": "string"}},
+                "properties": {"heading": {"type": "string", "minLength": 3}, "body": {"type": "string", "minLength": 20}},
                 "required": ["heading", "body"],
             },
         },
@@ -422,7 +425,12 @@ class Writer:
         if conflicts:
             user += "\n\nConflicts between sources:\n" + "\n".join(f"- {c}" for c in conflicts)
         data = self.llm.generate_json(WRITER_SYSTEM, user, schema=REPORT_SCHEMA, max_tokens=WRITER_MAX_TOKENS)
-        return _assemble_report(data)
+        report = _assemble_report(data)
+        known = set().union(*(item.cited_ids for item in all_findings))
+        if not set(cited_ids(report)) & known:
+            # e.g. the model copied the instructions into the fields instead of writing the report
+            raise LLMError("The writer's report cites none of the sources.")
+        return report
 
 
 def _assemble_report(data: dict) -> str:
