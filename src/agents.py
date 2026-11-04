@@ -1,7 +1,9 @@
 """The four agents: Planner, Researcher, Reviewer and Writer.
 
-Each agent has one prompt and makes one model call. Planner, Researcher and
-Reviewer return structured data (JSON schema output); the Writer returns Markdown.
+Each model call has one narrow prompt and a JSON schema for its answer; the
+Reviewer makes two calls (gaps, then conflicts), the others one each. The
+Writer's JSON sections are assembled into Markdown in code.
+
 Agents validate the model's output instead of trusting it: the Researcher, for
 example, drops citations to sources it was never shown.
 """

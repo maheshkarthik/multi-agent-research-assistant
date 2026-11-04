@@ -42,10 +42,21 @@ flowchart TD
         L[Local PDFs: hybrid search]
     end
     R1 & R2 & R3 --> Tools
-    R1 & R2 & R3 -->|findings with source ids| S[Writer agent]
+    R1 & R2 & R3 -->|findings with source ids| V[Reviewer agent]
+    V -->|up to 2 follow-up questions| Tools
+    V -->|findings + conflicts| S[Writer agent]
     S --> C[Citation checker]
     C --> OUT[Report + sources + trace]
 ```
+
+### 4.0 Reviewer (added after milestone 4)
+
+The reviewer was planned as a stretch goal that reads the finished draft. It was built to review the **findings before the report is written** instead, because the writer is the slowest call on an 8 GB machine and reviewing a draft would mean writing it twice. It makes two small calls:
+
+1. **Gap check:** proposes up to 2 follow-up questions. They get one extra research round; a follow-up whose search finds no new sources skips its model call.
+2. **Conflict check:** compares numbered findings and returns pairs that disagree. Code keeps a pair only if the two findings rest on different sources. The writer is told to state each conflict instead of blending the values.
+
+Live testing showed a 4B model finds conflicts unreliably when the check is one rule in a longer prompt (0 of 3 tries) and much better as a dedicated call that groups findings by topic first (2 of 3). It stays best-effort and is described as such in the README. It is on by default in the UI and CLI (`--no-review` turns it off).
 
 ### 4.1 Orchestrator
 
@@ -140,7 +151,7 @@ docs/evaluation.md         Evaluation questions and results
 4. **Streamlit UI** with live progress and agent traces.
 5. **Tests, evaluation sheet, README with screenshot.** Then publish and add it to the profile.
 
-Stretch goals, after milestone 5: a **reviewer agent** that reads the draft, lists gaps and triggers one extra research round; letting researchers choose their own tools; a LangGraph version of the same pipeline for comparison.
+Stretch goals: a **reviewer agent** that lists gaps and triggers one extra research round (done before milestone 5, see section 4.0); letting researchers choose their own tools; a LangGraph version of the same pipeline for comparison.
 
 ## 12. Out of Scope
 
