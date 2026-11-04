@@ -1,0 +1,97 @@
+"""Tests for the model-output helpers, text excerpts, source registry and citation checks."""
+
+import unittest
+
+from src.citations import check_citations, cited_ids
+from src.llm import LLMError, parse_json_object, strip_reasoning
+from src.sources import SourceRegistry
+from src.text import best_excerpt, keywords
+from tests.fakes import evidence
+
+
+class StripReasoningTests(unittest.TestCase):
+    def test_removes_full_think_block(self):
+        self.assertEqual(strip_reasoning("<think>hmm</think>\nAnswer"), "Answer")
+
+    def test_removes_text_before_lone_closing_tag(self):
+        # qwen3 sometimes writes its reasoning as plain text ending in </think>, even with thinking off
+        self.assertEqual(strip_reasoning("Let me plan this.\n</think>\n\nThe report."), "The report.")
+
+    def test_leaves_normal_text_alone(self):
+        self.assertEqual(strip_reasoning("  Plain answer.  "), "Plain answer.")
+
+
+class ParseJsonTests(unittest.TestCase):
+    def test_parses_object_inside_code_fence(self):
+        self.assertEqual(parse_json_object('```json\n{"a": 1}\n```'), {"a": 1})
+
+    def test_rejects_non_json(self):
+        with self.assertRaises(LLMError):
+            parse_json_object("no json here")
+
+    def test_rejects_malformed_json(self):
+        with self.assertRaises(LLMError):
+            parse_json_object('{"a": }')
+
+
+class ExcerptTests(unittest.TestCase):
+    def test_short_text_is_returned_unchanged(self):
+        self.assertEqual(best_excerpt("Short text.", "anything"), "Short text.")
+
+    def test_prefers_matching_paragraphs_in_original_order(self):
+        filler = "Unrelated filler sentence about gardening and weather patterns in spring. " * 3
+        text = "\n".join([filler, "The printing press spread science quickly across Europe.", filler,
+                          "Science journals relied on the printing press for distribution.", filler])
+        excerpt = best_excerpt(text, "printing press science", limit=200)
+        self.assertIn("spread science quickly", excerpt)
+        self.assertIn("journals", excerpt)
+        self.assertNotIn("gardening", excerpt)
+        self.assertLess(excerpt.index("spread"), excerpt.index("journals"))
+
+    def test_never_exceeds_limit_by_much(self):
+        text = ("printing press " * 400 + "\n") * 3
+        self.assertLessEqual(len(best_excerpt(text, "printing press", limit=500)), 504)
+
+    def test_falls_back_to_start_when_nothing_matches(self):
+        text = "Alpha beta gamma delta epsilon zeta eta theta. " * 100
+        self.assertTrue(best_excerpt(text, "printing press", limit=100).startswith("Alpha beta"))
+
+    def test_keywords_drop_stopwords(self):
+        self.assertEqual(keywords("How did the printing press change science?"), {"printing", "press", "change", "science"})
+
+
+class SourceRegistryTests(unittest.TestCase):
+    def test_numbers_sources_from_one(self):
+        registry = SourceRegistry()
+        first = registry.register(evidence("A", "https://a.example"))
+        second = registry.register(evidence("B", "https://b.example"))
+        self.assertEqual((first.id, second.id), (1, 2))
+        self.assertEqual(len(registry), 2)
+
+    def test_same_page_keeps_its_number(self):
+        registry = SourceRegistry()
+        first = registry.register(evidence("A", "https://www.a.example/page/"))
+        again = registry.register(evidence("A again", "http://a.example/page#section"))
+        self.assertEqual(first.id, again.id)
+        self.assertEqual(len(registry), 1)
+
+
+class CitationTests(unittest.TestCase):
+    def test_extracts_all_citation_styles(self):
+        self.assertEqual(cited_ids("Fact [2]. Another [1, 3]. More [4][2]."), [2, 1, 3, 4])
+
+    def test_flags_unknown_ids(self):
+        check = check_citations("A long enough sentence that states a fact about something important [1][9].", {1, 2})
+        self.assertEqual(check.cited_ids, [1])
+        self.assertEqual(check.unknown_ids, [9])
+        self.assertFalse(check.ok)
+
+    def test_flags_long_uncited_paragraphs_but_not_headings(self):
+        report = "## A heading without citations\n\nThis paragraph makes a claim without any citation at all, sadly.\n\nCited claim that is long enough to be checked by the citation checker [1]."
+        check = check_citations(report, {1})
+        self.assertEqual(len(check.uncited_paragraphs), 1)
+        self.assertIn("without any citation", check.uncited_paragraphs[0])
+
+
+if __name__ == "__main__":
+    unittest.main()
