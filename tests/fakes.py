@@ -63,6 +63,9 @@ class FakeLLM:
 
     def generate_json(self, system: str, user: str, *, schema, max_tokens: int = 1024) -> dict[str, Any]:
         reply = self._reply(system, user)
+        if isinstance(reply, str) and self.calls[-1][0] == "writer":
+            # tests script the writer as plain text; it becomes the report's summary
+            return {"summary": reply, "sections": [], "conclusion": ""}
         if not isinstance(reply, dict):
             raise LLMError("not JSON")
         return reply

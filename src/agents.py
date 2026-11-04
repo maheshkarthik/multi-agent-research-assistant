@@ -25,7 +25,7 @@ PLANNER_ATTEMPTS = 2
 MAX_FINDINGS = 6
 MAX_FOLLOW_UPS = 2
 CONFLICTS_MAX_TOKENS = 1500  # the topic grouping makes this reply longer than the others
-WRITER_MAX_TOKENS = 2000  # a report is usually 600 to 1,200 tokens
+WRITER_MAX_TOKENS = 2000  # a report is usually 400 to 1,000 tokens
 
 
 # ---------------------------------------------------------------- data passed between agents
@@ -378,17 +378,34 @@ def _cite(finding: Finding) -> str:
 
 WRITER_SYSTEM = """You are the writing agent of a research team. Write a research report that answers the question using ONLY the findings provided.
 Rules:
-- Cite every factual sentence with the source numbers from the findings in square brackets, for example [2] or [1][4].
+- End every sentence that states a fact with the source numbers from the findings in square brackets, for example [2] or [1][4].
 - Only use source numbers that appear in the findings. Never invent sources or facts.
-- Do not add a title. Start with a short summary paragraph (2 to 3 sentences) that directly answers the question.
-- Then write one section per sub-question, each with a short descriptive "## " heading (not "Sub-question 1").
-- Findings under a "Follow-up" heading fill gaps: put them in the section they belong to. Give them their own section only if they cover a new aspect.
-- End with a "## Conclusion" section.
+- "summary": 2 to 3 sentences that directly answer the question.
+- "sections": one per sub-question, each with a short descriptive heading (not "Sub-question 1") and a body of one or two paragraphs. Findings under a "Follow-up" heading fill gaps: put them in the section they belong to.
+- "conclusion": 2 to 3 sentences.
 - If conflicts between sources are listed, state each one plainly in the relevant section, citing both sources. Do not merge conflicting facts into a range or pick one silently.
 - If something could not be found, say briefly that the sources do not cover it.
 - Write about the topic only. Never mention the findings, sub-questions, reviewer or research process.
-- Do not include a list of sources; it is added automatically.
 - Write in clear, plain English. Do not repeat the same fact in several sections."""
+
+# Structured output keeps qwen3 from writing out its reasoning before the report:
+# as free text it spent 2,000+ tokens planning, as JSON it starts writing at once.
+REPORT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "sections": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"heading": {"type": "string"}, "body": {"type": "string"}},
+                "required": ["heading", "body"],
+            },
+        },
+        "conclusion": {"type": "string"},
+    },
+    "required": ["summary", "sections", "conclusion"],
+}
 
 
 class Writer:
@@ -396,11 +413,35 @@ class Writer:
         self.llm = llm
 
     def run(self, question: str, all_findings: list[Findings], conflicts: list[str] | None = None) -> str:
-        """Return a Markdown report built only from ``all_findings``, pointing out ``conflicts``."""
+        """Return a Markdown report built only from ``all_findings``, pointing out ``conflicts``.
+
+        Raises:
+            LLMError: If the model returns no usable report.
+        """
         user = f"Research question: {question}\n\nFindings:\n\n{format_findings(all_findings)}"
         if conflicts:
             user += "\n\nConflicts between sources:\n" + "\n".join(f"- {c}" for c in conflicts)
-        return self.llm.generate(WRITER_SYSTEM, user, max_tokens=WRITER_MAX_TOKENS)
+        data = self.llm.generate_json(WRITER_SYSTEM, user, schema=REPORT_SCHEMA, max_tokens=WRITER_MAX_TOKENS)
+        return _assemble_report(data)
+
+
+def _assemble_report(data: dict) -> str:
+    """Turn the writer's JSON into Markdown: summary, one ``##`` section each, conclusion."""
+    parts = [str(data.get("summary", "")).strip()]
+    for section in data.get("sections") or []:
+        if not isinstance(section, dict):
+            continue
+        heading = str(section.get("heading", "")).strip().lstrip("#").strip()
+        body = str(section.get("body", "")).strip()
+        if body:
+            parts.append(f"## {heading or 'Details'}\n\n{body}")
+    conclusion = str(data.get("conclusion", "")).strip()
+    if conclusion:
+        parts.append(f"## Conclusion\n\n{conclusion}")
+    report = "\n\n".join(part for part in parts if part)
+    if not report:
+        raise LLMError("The writer returned an empty report.")
+    return report
 
 
 def format_findings(all_findings: list[Findings]) -> str:

@@ -190,6 +190,18 @@ class WriterTests(unittest.TestCase):
         self.assertIn("Sub-question 2: How?\n- (no findings)", user)
         self.assertNotIn("Conflicts", user)
 
+    def test_json_report_is_assembled_into_markdown(self):
+        reply = {"summary": "Short answer [1].",
+                 "sections": [{"heading": "## Causes", "body": "Because [1]."}, {"heading": "Empty", "body": " "}],
+                 "conclusion": "So [1]."}
+        report = Writer(FakeLLM(writer=reply)).run("Main?", [Findings(SubQuestion(1, "Why?", []), [Finding("B.", [1])])])
+        self.assertEqual(report, "Short answer [1].\n\n## Causes\n\nBecause [1].\n\n## Conclusion\n\nSo [1].")
+
+    def test_empty_json_report_is_an_error(self):
+        llm = FakeLLM(writer={"summary": "", "sections": [], "conclusion": ""})
+        with self.assertRaises(LLMError):
+            Writer(llm).run("Main?", [Findings(SubQuestion(1, "Why?", []), [Finding("B.", [1])])])
+
     def test_conflicts_and_follow_ups_are_labelled(self):
         llm = FakeLLM(writer="Report [1].")
         findings = [Findings(SubQuestion(3, "Why?", [], follow_up=True), [Finding("Because.", [1])])]
