@@ -15,16 +15,22 @@ import json
 import os
 import re
 import threading
+import logging
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_MODEL = "qwen3:4b"
 DEFAULT_TIMEOUT_SECONDS = 300.0  # the first request also loads the model into memory
-DEFAULT_NUM_CTX = 4096
+# One context size for every call: Ollama reloads the model whenever num_ctx changes,
+# which on an 8 GB machine can add minutes to the next call.
+NUM_CTX = 6144
+DEFAULT_MAX_TOKENS = 1024  # caps runaway output; small models occasionally loop until the timeout
 DEFAULT_TEMPERATURE = 0.2
 KEEP_ALIVE = "15m"  # keep the model loaded between agent steps
 
@@ -51,11 +57,11 @@ class LLM(Protocol):
     """What agents need from a language model. Tests provide a fake."""
 
     def generate(
-        self, system: str, user: str, *, schema: dict[str, Any] | None = None, num_ctx: int = DEFAULT_NUM_CTX
+        self, system: str, user: str, *, schema: dict[str, Any] | None = None, max_tokens: int = DEFAULT_MAX_TOKENS
     ) -> str: ...
 
     def generate_json(
-        self, system: str, user: str, *, schema: dict[str, Any], num_ctx: int = DEFAULT_NUM_CTX
+        self, system: str, user: str, *, schema: dict[str, Any], max_tokens: int = DEFAULT_MAX_TOKENS
     ) -> dict[str, Any]: ...
 
 
@@ -94,7 +100,7 @@ class OllamaLLM:
         self.stats = LLMStats()
 
     def generate(
-        self, system: str, user: str, *, schema: dict[str, Any] | None = None, num_ctx: int = DEFAULT_NUM_CTX
+        self, system: str, user: str, *, schema: dict[str, Any] | None = None, max_tokens: int = DEFAULT_MAX_TOKENS
     ) -> str:
         """Return the model's reply to one system + user message pair."""
         payload: dict[str, Any] = {
@@ -102,7 +108,7 @@ class OllamaLLM:
             "stream": False,
             "think": False,
             "keep_alive": KEEP_ALIVE,
-            "options": {"temperature": self.temperature, "num_ctx": num_ctx},
+            "options": {"temperature": self.temperature, "num_ctx": NUM_CTX, "num_predict": max_tokens},
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         }
         if schema is not None:
@@ -118,13 +124,15 @@ class OllamaLLM:
             int(response.get("prompt_eval_count") or 0),
             int(response.get("eval_count") or 0),
         )
+        if response.get("done_reason") == "length":
+            logger.warning("Model output was cut off at %d tokens", max_tokens)
         return strip_reasoning(message["content"])
 
     def generate_json(
-        self, system: str, user: str, *, schema: dict[str, Any], num_ctx: int = DEFAULT_NUM_CTX
+        self, system: str, user: str, *, schema: dict[str, Any], max_tokens: int = DEFAULT_MAX_TOKENS
     ) -> dict[str, Any]:
         """Return the model's reply parsed as a JSON object that follows ``schema``."""
-        text = self.generate(system, user, schema=schema, num_ctx=num_ctx)
+        text = self.generate(system, user, schema=schema, max_tokens=max_tokens)
         return parse_json_object(text)
 
     def list_models(self) -> list[str]:

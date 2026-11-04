@@ -55,13 +55,13 @@ class FakeLLM:
             raise AssertionError(f"FakeLLM has no reply for the {agent}")
         return reply
 
-    def generate(self, system: str, user: str, *, schema=None, num_ctx: int = 4096) -> str:
+    def generate(self, system: str, user: str, *, schema=None, max_tokens: int = 1024) -> str:
         reply = self._reply(system, user)
         if isinstance(reply, dict):
             raise AssertionError("generate() called where a text reply was expected")
         return reply
 
-    def generate_json(self, system: str, user: str, *, schema, num_ctx: int = 4096) -> dict[str, Any]:
+    def generate_json(self, system: str, user: str, *, schema, max_tokens: int = 1024) -> dict[str, Any]:
         reply = self._reply(system, user)
         if not isinstance(reply, dict):
             raise LLMError("not JSON")

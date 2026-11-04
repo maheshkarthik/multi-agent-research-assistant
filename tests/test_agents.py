@@ -162,6 +162,13 @@ class ReviewerTests(unittest.TestCase):
         self.assertEqual(len(conflicts), 1)  # (1, 2) share source 1; (3, 1) and (1, 3) are one pair
         self.assertTrue(conflicts[0].startswith('"Length is 10." [3] versus "Length is 14." [1]'))
 
+    def test_pairs_stating_the_same_numbers_are_dropped(self):
+        findings = [
+            Findings(SubQuestion(1, "A?", []), [Finding("Ratings are 10.0 to 13.0.", [1])]),
+            Findings(SubQuestion(2, "B?", []), [Finding("Ratings reach 10-13 or higher.", [2])]),
+        ]
+        self.assertEqual(Reviewer(FakeLLM(conflicts=conflicts_reply((1, 2)))).find_conflicts("Q?", findings), [])
+
     def test_fewer_than_two_findings_need_no_conflict_check(self):
         llm = FakeLLM()
         self.assertEqual(Reviewer(llm).find_conflicts("Main?", self.findings[1:]), [])

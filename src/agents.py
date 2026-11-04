@@ -9,6 +9,7 @@ example, drops citations to sources it was never shown.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 
 from src.llm import LLM, LLMError
@@ -16,12 +17,15 @@ from src.sources import Source
 
 logger = logging.getLogger(__name__)
 
+_NUMBER = re.compile(r"\d+(?:\.\d+)?")
+
 MIN_DEPTH, MAX_DEPTH = 2, 5
 MAX_QUERIES_PER_QUESTION = 2
 PLANNER_ATTEMPTS = 2
 MAX_FINDINGS = 6
 MAX_FOLLOW_UPS = 2
-WRITER_NUM_CTX = 8192
+CONFLICTS_MAX_TOKENS = 1500  # the topic grouping makes this reply longer than the others
+WRITER_MAX_TOKENS = 2000  # a report is usually 600 to 1,200 tokens
 
 
 # ---------------------------------------------------------------- data passed between agents
@@ -273,7 +277,7 @@ CONFLICTS_SYSTEM = """You are the reviewing agent of a research team. You check 
 Two findings contradict when they give different values for the same thing: a different number, date, name, rule or yes/no answer.
 Go through the findings topic by topic (for example: amounts, frequency, dates, names). For each topic, compare what every finding says.
 Report each contradicting pair by finding number and say in one short sentence what differs.
-Findings that agree, or that describe different things, are not contradictions."""
+Only report pairs that cannot both be true. These are NOT contradictions: findings that say the same thing in different words, one finding that is more specific than the other, findings that describe different things, and "may help" versus "may harm" claims about different groups or conditions."""
 
 CONFLICTS_SCHEMA = {
     "type": "object",
@@ -341,7 +345,8 @@ class Reviewer:
             return []
         listing = "\n".join(f"F{i}. {f.claim} {_cite(f)}" for i, f in enumerate(flat, start=1))
         data = self.llm.generate_json(
-            CONFLICTS_SYSTEM, f"Research question: {question}\n\nFindings:\n{listing}", schema=CONFLICTS_SCHEMA
+            CONFLICTS_SYSTEM, f"Research question: {question}\n\nFindings:\n{listing}",
+            schema=CONFLICTS_SCHEMA, max_tokens=CONFLICTS_MAX_TOKENS,
         )
         conflicts, seen = [], set()
         for item in data.get("contradictions") or []:
@@ -351,12 +356,18 @@ class Reviewer:
             if len(pair) != 2 or not all(1 <= n <= len(flat) for n in pair) or frozenset(pair) in seen:
                 continue
             a, b = flat[pair[0] - 1], flat[pair[1] - 1]
-            if set(a.source_ids) & set(b.source_ids):
+            if set(a.source_ids) & set(b.source_ids) or _same_numbers(a.claim, b.claim):
                 continue
             seen.add(frozenset(pair))
             difference = str(item.get("difference", "")).strip()
             conflicts.append(f'"{a.claim}" {_cite(a)} versus "{b.claim}" {_cite(b)}' + (f": {difference}" if difference else ""))
         return conflicts
+
+
+def _same_numbers(a: str, b: str) -> bool:
+    """True when both claims contain numbers and the numbers match, such as "10.0 to 13.0" and "10-13"."""
+    numbers_a, numbers_b = (sorted({float(n) for n in _NUMBER.findall(text)}) for text in (a, b))
+    return bool(numbers_a) and numbers_a == numbers_b
 
 
 def _cite(finding: Finding) -> str:
@@ -389,7 +400,7 @@ class Writer:
         user = f"Research question: {question}\n\nFindings:\n\n{format_findings(all_findings)}"
         if conflicts:
             user += "\n\nConflicts between sources:\n" + "\n".join(f"- {c}" for c in conflicts)
-        return self.llm.generate(WRITER_SYSTEM, user, num_ctx=WRITER_NUM_CTX)
+        return self.llm.generate(WRITER_SYSTEM, user, max_tokens=WRITER_MAX_TOKENS)
 
 
 def format_findings(all_findings: list[Findings]) -> str:

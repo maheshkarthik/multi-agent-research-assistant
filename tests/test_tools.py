@@ -22,6 +22,17 @@ class UrlSafetyTests(unittest.TestCase):
                 with self.assertRaises(ToolError, msg=address):
                     check_url_is_public("http://innocent-looking.example/")
 
+    def test_redirect_to_a_private_address_is_blocked(self):
+        import urllib.request
+
+        from src.tools.web import _PublicOnlyRedirectHandler
+
+        handler = _PublicOnlyRedirectHandler()
+        request = urllib.request.Request("https://example.com/start")
+        with mock.patch("socket.getaddrinfo", return_value=[(None, None, None, None, ("169.254.169.254", 80))]):
+            with self.assertRaises(ToolError):
+                handler.redirect_request(request, None, 302, "Found", {}, "http://metadata.internal/")
+
     def test_allows_public_addresses(self):
         with mock.patch("socket.getaddrinfo", return_value=[(None, None, None, None, ("93.184.216.34", 443))]):
             check_url_is_public("https://example.com/page")

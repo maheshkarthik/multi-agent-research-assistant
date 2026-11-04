@@ -50,6 +50,20 @@ class OllamaErrorTests(unittest.TestCase):
             self.call_with(TimeoutError("timed out"))
         self.assertNotIsInstance(caught.exception, LLMConnectionError)
 
+    def test_every_call_uses_the_same_context_size_and_caps_output(self):
+        from unittest import mock
+
+        from src.llm import NUM_CTX, OllamaLLM
+
+        llm = OllamaLLM()
+        reply = {"message": {"content": "{}"}, "done_reason": "stop"}
+        with mock.patch.object(llm, "_post", return_value=reply) as post:
+            llm.generate("s", "u", max_tokens=2000)
+            llm.generate_json("s", "u", schema={"type": "object"})
+        options = [call.args[1]["options"] for call in post.call_args_list]
+        self.assertEqual([o["num_ctx"] for o in options], [NUM_CTX, NUM_CTX])  # a change would reload the model
+        self.assertEqual([o["num_predict"] for o in options], [2000, 1024])
+
     def test_refused_connection_is_a_connection_error(self):
         import urllib.error
 
