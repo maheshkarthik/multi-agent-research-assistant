@@ -19,9 +19,13 @@ from src.index import SAMPLES_DIR, index_document, index_pdfs
 from src.llm import LLMConnectionError, LLMError, OllamaLLM
 from src.local_docs import db_dir
 from src.orchestrator import (
+    CHECKING_CONFLICTS,
+    CONFLICTS_DONE,
     DONE,
     PLAN_READY,
     RESEARCHER_DONE,
+    REVIEW_DONE,
+    REVIEWING,
     SOURCES_FOUND,
     WARNING,
     WRITING,
@@ -30,6 +34,7 @@ from src.orchestrator import (
     ResearchRun,
 )
 from src.report import KIND_LABELS, demote_headings, link_citations, slugify, source_line
+from src.text import count
 from src.tools import make_tools
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
@@ -83,6 +88,11 @@ with st.sidebar:
     depth = st.slider(
         "Sub-questions", MIN_DEPTH, MAX_DEPTH, 3,
         help="How many parts the planner splits your question into. Each adds about 20 to 40 seconds.",
+    )
+    review = st.toggle(
+        "Reviewer agent", value=True,
+        help="Checks the findings for gaps, researches up to 2 follow-up questions, "
+             "and flags sources that contradict each other. Adds about 30 to 90 seconds.",
     )
 
     st.subheader("Local PDFs")
@@ -141,6 +151,8 @@ class ProgressView:
         self.box = st.status(":shimmer[Planning the research]", expanded=True)
         self.plan_step = self.box.status(":shimmer[Planner: splitting the question]", type="step")
         self.steps: dict[int, object] = {}
+        self.review_step = None
+        self.conflict_step = None
         self.writing_step = None
         self.warnings: list[str] = []
 
@@ -148,7 +160,7 @@ class ProgressView:
         data = event.data
         if event.kind == PLAN_READY:
             plan = data["plan"]
-            self.plan_step.update(label=f"Planner: {len(plan.sub_questions)} sub-questions", state="complete")
+            self.plan_step.update(label=f"Planner: {count(len(plan.sub_questions), 'sub-question')}", state="complete")
             self.plan_step.markdown("\n".join(f"{sq.number}. {sq.text}" for sq in plan.sub_questions))
             self.box.update(label=":shimmer[Researching]", expanded=True)
             for sq in plan.sub_questions:
@@ -162,8 +174,35 @@ class ProgressView:
         elif event.kind == RESEARCHER_DONE:
             sq, findings = data["sub_question"], data["findings"]
             failed = findings.error is not None
-            label = f"Researcher {sq.number}: " + ("failed" if failed else f"{len(findings.findings)} findings")
+            label = f"Researcher {sq.number}: " + ("failed" if failed else count(len(findings.findings), "finding"))
             self.steps[sq.number].update(label=label, state="error" if failed else "complete")
+        elif event.kind == REVIEWING:
+            self.box.update(label=":shimmer[Reviewing the findings]", expanded=True)
+            self.review_step = self.box.status(":shimmer[Reviewer: checking for gaps]", type="step")
+        elif event.kind == REVIEW_DONE:
+            follow_ups = data["follow_ups"]
+            if follow_ups is None:
+                self.review_step.update(label="Reviewer: gap check failed, skipped", state="error")
+                return
+            label = f"Reviewer: {count(len(follow_ups), 'follow-up question')}" if follow_ups else "Reviewer: no gaps found"
+            self.review_step.update(label=label, state="complete")
+            if follow_ups:
+                self.review_step.markdown("\n".join(f"{sq.number}. {sq.text}" for sq in follow_ups))
+                self.box.update(label=":shimmer[Researching follow-up questions]", expanded=True)
+            for sq in follow_ups:
+                self.steps[sq.number] = self.box.status(f":shimmer[Researcher {sq.number}: searching]", type="step")
+        elif event.kind == CHECKING_CONFLICTS:
+            self.box.update(label=":shimmer[Checking sources against each other]", expanded=True)
+            self.conflict_step = self.box.status(":shimmer[Reviewer: comparing findings]", type="step")
+        elif event.kind == CONFLICTS_DONE:
+            conflicts = data["conflicts"]
+            if conflicts is None:
+                self.conflict_step.update(label="Reviewer: conflict check failed, skipped", state="error")
+                return
+            label = f"Reviewer: {count(len(conflicts), 'conflict')} between sources" if conflicts else "Reviewer: no conflicts"
+            self.conflict_step.update(label=label, state="complete")
+            for conflict in conflicts:
+                self.conflict_step.caption(conflict)
         elif event.kind == WRITING:
             self.box.update(label=":shimmer[Writing the report]", expanded=True)
             self.writing_step = self.box.status(":shimmer[Writer: drafting the report]", type="step")
@@ -198,7 +237,9 @@ if submitted:
                 st.info(warning, icon=":material/info:")
             progress = ProgressView()
             try:
-                st.session_state.result = ResearchRun(OllamaLLM(), tools, depth=depth, on_event=progress).run(question)
+                st.session_state.result = ResearchRun(
+                    OllamaLLM(), tools, depth=depth, on_event=progress, review=review,
+                ).run(question)
             except UnclearQuestionError as exc:
                 progress.fail("Research stopped")
                 st.warning(str(exc), icon=":material/help:")
@@ -240,8 +281,11 @@ if result is not None:
     st.markdown("\n".join(f"- {source_line(s)}" for s in cited) or "No sources were cited.")
 
     with st.expander("How the agents worked", icon=":material/account_tree:"):
+        first_follow_up = result.review.follow_ups[0].number if result.review and result.review.follow_ups else None
         for item in result.findings:
             sq = item.sub_question
+            if sq.number == first_follow_up:
+                st.markdown("**Reviewer** asked for follow-up research on gaps it found:")
             st.markdown(f"**Researcher {sq.number}: {sq.text}**")
             st.caption("Searched for: " + "; ".join(sq.queries))
             kinds = sorted({KIND_LABELS[s.kind] for s in item.sources})
@@ -254,6 +298,10 @@ if result is not None:
                 st.caption(f"Gaps: {item.gaps}")
             if item.dropped_source_ids:
                 st.caption(f"Ignored citations to sources it wasn't given: {item.dropped_source_ids}")
+        if result.review and result.review.conflicts:
+            st.markdown("**Conflicts the reviewer found between sources**")
+            for conflict in result.review.conflicts:
+                st.caption(f"- {conflict}")
         if result.warnings:
             st.markdown("**Warnings**")
             for warning in result.warnings:

@@ -4,10 +4,15 @@ import unittest
 
 from src.llm import LLMConnectionError, LLMError
 from src.orchestrator import (
+    CHECKING_CONFLICTS,
+    CONFLICTS_DONE,
     DONE,
     NO_FINDINGS_REPORT,
+    NO_NEW_SOURCES,
     PLAN_READY,
     RESEARCHER_DONE,
+    REVIEW_DONE,
+    REVIEWING,
     SEARCHING,
     SOURCES_FOUND,
     WARNING,
@@ -15,7 +20,7 @@ from src.orchestrator import (
     ResearchRun,
 )
 from src.tools import ToolError
-from tests.fakes import FakeLLM, FakeTool, cite_all_researcher, evidence, plan_reply
+from tests.fakes import FakeLLM, FakeTool, cite_all_researcher, conflicts_reply, evidence, plan_reply, review_reply
 
 
 def run(llm, tools, depth=2, **kwargs):
@@ -116,6 +121,15 @@ class FailureTests(unittest.TestCase):
         self.assertIn("## First?", result.report)
         self.assertIn("A supported fact. [1]", result.report)
 
+    def test_writer_timeout_still_returns_the_findings(self):
+        from src.llm import LLMTimeoutError
+
+        llm = FakeLLM(planner=plan_reply("First?", "Second?"), researcher=cite_all_researcher,
+                      writer=LLMTimeoutError("slow"))
+        result, _ = run(llm, [FakeTool("web")])
+        self.assertIn("A supported fact. [1]", result.report)
+        self.assertTrue(any("writer failed" in w for w in result.warnings))
+
     def test_no_findings_skips_writer(self):
         llm = FakeLLM(planner=plan_reply("First?", "Second?"), researcher={"findings": [], "gaps": "Nothing"})
         result, _ = run(llm, [FakeTool("web")])
@@ -149,6 +163,81 @@ class FailureTests(unittest.TestCase):
             run(llm, [tool])
         self.assertEqual(tool.calls, [])
 
+    def test_reviewer_off_by_default(self):
+        llm = FakeLLM(planner=plan_reply("First?", "Second?"), researcher=cite_all_researcher, writer="Report [1].")
+        result, _ = run(llm, [FakeTool("web")])
+        self.assertNotIn("reviewer", llm.agents_called())
+        self.assertIsNone(result.review)
+
+
+class ReviewTests(unittest.TestCase):
+    def test_follow_ups_get_an_extra_research_round_then_conflicts_are_checked(self):
+        llm = FakeLLM(planner=plan_reply("First?", "Second?"), researcher=cite_all_researcher,
+                      reviewer=review_reply("Third?"), conflicts=conflicts_reply((1, 3)), writer="Report [1][3].")
+        tool = FakeTool("web")
+        result, events = run(llm, [tool], review=True)
+
+        self.assertEqual(llm.agents_called(),
+                         ["planner", "researcher", "researcher", "reviewer", "researcher", "conflicts", "writer"])
+        self.assertEqual([c[0] for c in tool.calls], ["First?", "Second?", "Third?"])
+        self.assertEqual([f.sub_question.number for f in result.findings], [1, 2, 3])
+        self.assertEqual([s.id for s in result.findings[2].sources], [3])
+        self.assertIn("F3. A supported fact. [3]", llm.calls[-2][2])  # follow-up findings are compared too
+        writer_prompt = llm.calls[-1][2]
+        self.assertIn('Conflicts between sources:\n- "A supported fact." [1] versus "A supported fact." [3]', writer_prompt)
+        self.assertIn("Follow-up 3: Third?", writer_prompt)
+        self.assertEqual([sq.text for sq in result.review.follow_ups], ["Third?"])
+        self.assertEqual(len(result.review.conflicts), 1)
+
+        kinds = [e.kind for e in events]
+        review_at = kinds.index(REVIEWING)
+        self.assertEqual(kinds[review_at:], [REVIEWING, REVIEW_DONE, SEARCHING, SOURCES_FOUND, RESEARCHER_DONE,
+                                             CHECKING_CONFLICTS, CONFLICTS_DONE, WRITING, DONE])
+
+    def test_complete_review_goes_straight_to_the_conflict_check(self):
+        llm = FakeLLM(planner=plan_reply("First?", "Second?"), researcher=cite_all_researcher,
+                      reviewer=review_reply(), writer="Report [1].")
+        result, _ = run(llm, [FakeTool("web")], review=True)
+        self.assertEqual(llm.agents_called(), ["planner", "researcher", "researcher", "reviewer", "conflicts", "writer"])
+        self.assertEqual(result.review.follow_ups, [])
+        self.assertEqual(result.review.conflicts, [])
+        self.assertNotIn("Conflicts", llm.calls[-1][2])
+
+    def test_failed_checks_are_skipped_with_warnings(self):
+        llm = FakeLLM(planner=plan_reply("First?", "Second?"), researcher=cite_all_researcher,
+                      reviewer=LLMError("garbled"), conflicts=LLMError("garbled"), writer="Report [1].")
+        result, events = run(llm, [FakeTool("web")], review=True)
+        self.assertEqual(result.report, "Report [1].")
+        self.assertEqual(sum("reviewer failed" in w for w in result.warnings), 2)
+        self.assertIsNone(next(e for e in events if e.kind == REVIEW_DONE).data["follow_ups"])
+        self.assertIsNone(next(e for e in events if e.kind == CONFLICTS_DONE).data["conflicts"])
+
+    def test_ollama_down_during_review_stops_the_run(self):
+        llm = FakeLLM(planner=plan_reply("First?", "Second?"), researcher=cite_all_researcher,
+                      reviewer=LLMConnectionError("down"))
+        with self.assertRaises(LLMConnectionError):
+            run(llm, [FakeTool("web")], review=True)
+
+    def test_follow_up_with_no_new_sources_skips_its_researcher(self):
+        same_page = FakeTool("web", lambda sq: [evidence("Same page", "https://same.example")])
+        llm = FakeLLM(planner=plan_reply("First?", "Second?"), researcher=cite_all_researcher,
+                      reviewer=review_reply("Third?"), writer="Report [1].")
+        result, _ = run(llm, [same_page], review=True)
+        self.assertEqual(llm.agents_called(), ["planner", "researcher", "researcher", "reviewer", "conflicts", "writer"])
+        self.assertEqual(result.findings[2].gaps, NO_NEW_SOURCES)
+        self.assertNotIn("Third?", llm.calls[-1][2])  # an empty follow-up isn't given to the writer
+
+    def test_follow_ups_can_rescue_a_run_with_no_findings(self):
+        def researcher(system, user):
+            return cite_all_researcher(system, user) if "Better?" in user else {"findings": [], "gaps": "Nothing"}
+
+        llm = FakeLLM(planner=plan_reply("First?", "Second?"), researcher=researcher,
+                      reviewer=review_reply("Better?"), writer="Report [3].")
+        result, _ = run(llm, [FakeTool("web")], review=True)
+        self.assertEqual(result.report, "Report [3].")
+
+
+class ValidationTests(unittest.TestCase):
     def test_empty_question_and_no_tools_are_rejected(self):
         with self.assertRaises(ValueError):
             ResearchRun(FakeLLM(), [FakeTool()]).run("   ")

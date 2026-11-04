@@ -1,7 +1,7 @@
-"""The three agents: Planner, Researcher and Writer.
+"""The four agents: Planner, Researcher, Reviewer and Writer.
 
-Each agent has one prompt and makes one model call. Planner and Researcher
-return structured data (JSON schema output); the Writer returns Markdown.
+Each agent has one prompt and makes one model call. Planner, Researcher and
+Reviewer return structured data (JSON schema output); the Writer returns Markdown.
 Agents validate the model's output instead of trusting it: the Researcher, for
 example, drops citations to sources it was never shown.
 """
@@ -20,6 +20,7 @@ MIN_DEPTH, MAX_DEPTH = 2, 5
 MAX_QUERIES_PER_QUESTION = 2
 PLANNER_ATTEMPTS = 2
 MAX_FINDINGS = 6
+MAX_FOLLOW_UPS = 2
 WRITER_NUM_CTX = 8192
 
 
@@ -31,6 +32,7 @@ class SubQuestion:
     number: int
     text: str
     queries: list[str]
+    follow_up: bool = False  # asked by the reviewer to fill a gap
 
 
 @dataclass(frozen=True)
@@ -138,10 +140,10 @@ class Planner:
         return Plan(question, sub_questions)
 
 
-def _parse_sub_questions(data: dict, depth: int) -> list[SubQuestion]:
+def _parse_sub_questions(data: dict, limit: int, key: str = "sub_questions", seen: set[str] | None = None) -> list[SubQuestion]:
     result: list[SubQuestion] = []
-    seen: set[str] = set()
-    for item in data.get("sub_questions") or []:
+    seen = set(seen or ())
+    for item in data.get(key) or []:
         if not isinstance(item, dict):
             continue
         text = str(item.get("question", "")).strip()
@@ -150,7 +152,7 @@ def _parse_sub_questions(data: dict, depth: int) -> list[SubQuestion]:
         seen.add(text.lower())
         queries = [str(q).strip() for q in item.get("search_queries") or [] if str(q).strip()]
         result.append(SubQuestion(len(result) + 1, text, queries[:MAX_QUERIES_PER_QUESTION] or [text]))
-        if len(result) == depth:
+        if len(result) == limit:
             break
     return result
 
@@ -239,6 +241,128 @@ def _int_list(value: object) -> list[int]:
     return result
 
 
+# ---------------------------------------------------------------- reviewer
+
+REVIEWER_SYSTEM = """You are the reviewing agent of a research team. Before the report is written, check whether the researchers' findings answer the research question.
+Rules:
+- If an important part of the question is unanswered or a sub-question has no findings, propose up to {max_follow_ups} follow-up questions that would fill the gap. Each needs 1 or 2 search queries of 3 to 8 keywords.
+- Never propose a follow-up that asks the same thing as a sub-question already researched, even in different words.
+- Do not ask for small details the sources are unlikely to cover.
+- If the findings answer the question, set "complete" to true and return no follow-ups."""
+
+REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "complete": {"type": "boolean"},
+        "follow_ups": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "search_queries": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["question", "search_queries"],
+            },
+        },
+    },
+    "required": ["complete", "follow_ups"],
+}
+
+CONFLICTS_SYSTEM = """You are the reviewing agent of a research team. You check numbered findings for contradictions.
+Two findings contradict when they give different values for the same thing: a different number, date, name, rule or yes/no answer.
+Go through the findings topic by topic (for example: amounts, frequency, dates, names). For each topic, compare what every finding says.
+Report each contradicting pair by finding number and say in one short sentence what differs.
+Findings that agree, or that describe different things, are not contradictions."""
+
+CONFLICTS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "topics": {  # making the model group findings first is what gets a 4B model to compare them
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"topic": {"type": "string"}, "finding_numbers": {"type": "array", "items": {"type": "integer"}}},
+                "required": ["topic", "finding_numbers"],
+            },
+        },
+        "contradictions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "finding_a": {"type": "integer"},
+                    "finding_b": {"type": "integer"},
+                    "difference": {"type": "string"},
+                },
+                "required": ["finding_a", "finding_b", "difference"],
+            },
+        },
+    },
+    "required": ["topics", "contradictions"],
+}
+
+
+@dataclass(frozen=True)
+class Review:
+    follow_ups: list[SubQuestion]  # numbered after the existing sub-questions
+    conflicts: list[str] = field(default_factory=list)  # findings from different sources that disagree
+
+
+class Reviewer:
+    """Two checks, each one small model call: gaps before the follow-up round, conflicts after it."""
+
+    def __init__(self, llm: LLM) -> None:
+        self.llm = llm
+
+    def find_gaps(self, question: str, all_findings: list[Findings]) -> list[SubQuestion]:
+        """Follow-up questions for parts of ``question`` the findings don't answer."""
+        data = self.llm.generate_json(
+            REVIEWER_SYSTEM.format(max_follow_ups=MAX_FOLLOW_UPS),
+            f"Research question: {question}\n\nFindings:\n\n{format_findings(all_findings)}",
+            schema=REVIEW_SCHEMA,
+        )
+        if data.get("complete") is True:
+            return []
+        asked = {item.sub_question.text.lower() for item in all_findings}
+        follow_ups = _parse_sub_questions(data, MAX_FOLLOW_UPS, key="follow_ups", seen=asked)
+        first = max((item.sub_question.number for item in all_findings), default=0) + 1
+        return [SubQuestion(first + i, sq.text, sq.queries, follow_up=True) for i, sq in enumerate(follow_ups)]
+
+    def find_conflicts(self, question: str, all_findings: list[Findings]) -> list[str]:
+        """Pairs of findings that disagree, written out with their citations for the writer.
+
+        A pair is kept only if the two findings rest on different sources: a finding
+        can't contradict another taken from the same page, and small models often
+        report pairs that merely repeat each other.
+        """
+        flat = [finding for item in all_findings for finding in item.findings]
+        if len(flat) < 2:
+            return []
+        listing = "\n".join(f"F{i}. {f.claim} {_cite(f)}" for i, f in enumerate(flat, start=1))
+        data = self.llm.generate_json(
+            CONFLICTS_SYSTEM, f"Research question: {question}\n\nFindings:\n{listing}", schema=CONFLICTS_SCHEMA
+        )
+        conflicts, seen = [], set()
+        for item in data.get("contradictions") or []:
+            if not isinstance(item, dict):
+                continue
+            pair = _int_list([item.get("finding_a"), item.get("finding_b")])
+            if len(pair) != 2 or not all(1 <= n <= len(flat) for n in pair) or frozenset(pair) in seen:
+                continue
+            a, b = flat[pair[0] - 1], flat[pair[1] - 1]
+            if set(a.source_ids) & set(b.source_ids):
+                continue
+            seen.add(frozenset(pair))
+            difference = str(item.get("difference", "")).strip()
+            conflicts.append(f'"{a.claim}" {_cite(a)} versus "{b.claim}" {_cite(b)}' + (f": {difference}" if difference else ""))
+        return conflicts
+
+
+def _cite(finding: Finding) -> str:
+    return "".join(f"[{i}]" for i in finding.source_ids)
+
+
 # ---------------------------------------------------------------- writer
 
 WRITER_SYSTEM = """You are the writing agent of a research team. Write a research report that answers the question using ONLY the findings provided.
@@ -247,8 +371,11 @@ Rules:
 - Only use source numbers that appear in the findings. Never invent sources or facts.
 - Do not add a title. Start with a short summary paragraph (2 to 3 sentences) that directly answers the question.
 - Then write one section per sub-question, each with a short descriptive "## " heading (not "Sub-question 1").
+- Findings under a "Follow-up" heading fill gaps: put them in the section they belong to. Give them their own section only if they cover a new aspect.
 - End with a "## Conclusion" section.
-- If findings disagree, say so. If something could not be found, say so briefly.
+- If conflicts between sources are listed, state each one plainly in the relevant section, citing both sources. Do not merge conflicting facts into a range or pick one silently.
+- If something could not be found, say briefly that the sources do not cover it.
+- Write about the topic only. Never mention the findings, sub-questions, reviewer or research process.
 - Do not include a list of sources; it is added automatically.
 - Write in clear, plain English. Do not repeat the same fact in several sections."""
 
@@ -257,16 +384,24 @@ class Writer:
     def __init__(self, llm: LLM) -> None:
         self.llm = llm
 
-    def run(self, question: str, all_findings: list[Findings]) -> str:
-        """Return a Markdown report built only from ``all_findings``."""
-        sections = []
-        for item in all_findings:
-            lines = [f"### Sub-question {item.sub_question.number}: {item.sub_question.text}"]
-            lines += [f"- {f.claim} " + "".join(f"[{i}]" for i in f.source_ids) for f in item.findings]
-            if not item.findings:
-                lines.append("- (no findings)")
-            if item.gaps:
-                lines.append(f"Gaps: {item.gaps}")
-            sections.append("\n".join(lines))
-        user = f"Research question: {question}\n\nFindings:\n\n" + "\n\n".join(sections)
+    def run(self, question: str, all_findings: list[Findings], conflicts: list[str] | None = None) -> str:
+        """Return a Markdown report built only from ``all_findings``, pointing out ``conflicts``."""
+        user = f"Research question: {question}\n\nFindings:\n\n{format_findings(all_findings)}"
+        if conflicts:
+            user += "\n\nConflicts between sources:\n" + "\n".join(f"- {c}" for c in conflicts)
         return self.llm.generate(WRITER_SYSTEM, user, num_ctx=WRITER_NUM_CTX)
+
+
+def format_findings(all_findings: list[Findings]) -> str:
+    """The findings as text for the reviewer and writer, one block per sub-question."""
+    sections = []
+    for item in all_findings:
+        sq = item.sub_question
+        lines = [f"### {'Follow-up' if sq.follow_up else 'Sub-question'} {sq.number}: {sq.text}"]
+        lines += [f"- {f.claim} {_cite(f)}" for f in item.findings]
+        if not item.findings:
+            lines.append("- (no findings)")
+        if item.gaps:
+            lines.append(f"Gaps: {item.gaps}")
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections)

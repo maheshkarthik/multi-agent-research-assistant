@@ -37,7 +37,14 @@ class LLMError(Exception):
 
 
 class LLMConnectionError(LLMError):
-    """Ollama is not reachable or timed out."""
+    """Ollama is not reachable."""
+
+
+class LLMTimeoutError(LLMError):
+    """Ollama is running but took too long, usually because the machine is short of memory.
+
+    Not a connection error: Ollama is still up, so the run can continue without this one step.
+    """
 
 
 class LLM(Protocol):
@@ -148,8 +155,9 @@ class OllamaLLM:
         except (TimeoutError, urllib.error.URLError) as exc:
             reason = getattr(exc, "reason", exc)
             if isinstance(reason, TimeoutError) or isinstance(exc, TimeoutError):
-                raise LLMConnectionError(
-                    f"Ollama at {self.base_url} did not respond within {self.timeout:.0f} seconds."
+                raise LLMTimeoutError(
+                    f"Ollama did not respond within {self.timeout:.0f} seconds. "
+                    "Closing other apps to free memory usually helps."
                 ) from exc
             raise LLMConnectionError(
                 f"Could not connect to Ollama at {self.base_url}. "

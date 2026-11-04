@@ -1,4 +1,4 @@
-"""Command-line research: python -m src.cli "your question" [--depth 3] [--output report.md]"""
+"""Command-line research: python -m src.cli "your question" [--depth 3] [--no-review] [--output report.md]"""
 
 from __future__ import annotations
 
@@ -8,7 +8,19 @@ import sys
 from pathlib import Path
 
 from src.llm import LLMConnectionError, LLMError, OllamaLLM
-from src.orchestrator import PLAN_READY, RESEARCHER_DONE, SOURCES_FOUND, WARNING, WRITING, Event, ResearchRun
+from src.orchestrator import (
+    CHECKING_CONFLICTS,
+    CONFLICTS_DONE,
+    PLAN_READY,
+    RESEARCHER_DONE,
+    REVIEW_DONE,
+    REVIEWING,
+    SOURCES_FOUND,
+    WARNING,
+    WRITING,
+    Event,
+    ResearchRun,
+)
 from src.tools import SOURCE_CHOICES, make_tools
 
 
@@ -19,8 +31,16 @@ def print_event(event: Event) -> None:
             print(f"  {sq.number}. {sq.text}")
             print(f"     queries: {'; '.join(sq.queries)}")
         print()
-    elif event.kind in (SOURCES_FOUND, RESEARCHER_DONE, WRITING):
+    elif event.kind in (SOURCES_FOUND, RESEARCHER_DONE, REVIEWING, CHECKING_CONFLICTS, WRITING):
         print(f"- {event.message}")
+    elif event.kind == REVIEW_DONE:
+        print(f"- {event.message}")
+        for sq in event.data["follow_ups"] or []:
+            print(f"  {sq.number}. {sq.text}")
+    elif event.kind == CONFLICTS_DONE:
+        print(f"- {event.message}")
+        for conflict in event.data["conflicts"] or []:
+            print(f"  {conflict}")
     elif event.kind == WARNING:
         print(f"! {event.message}", file=sys.stderr)
 
@@ -31,6 +51,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--depth", type=int, default=3, help="number of sub-questions, 2 to 5 (default 3)")
     parser.add_argument("--sources", choices=SOURCE_CHOICES, default="both",
                         help="where to research: web (DuckDuckGo + Wikipedia), local (indexed PDFs) or both (default)")
+    parser.add_argument("--no-review", action="store_true",
+                        help="skip the reviewer agent and its follow-up research (faster)")
     parser.add_argument("--output", type=Path, help="save the report as Markdown to this file")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
@@ -39,7 +61,7 @@ def main(argv: list[str] | None = None) -> int:
         tools, warnings = make_tools(args.sources)
         for warning in warnings:
             print(f"! {warning}", file=sys.stderr)
-        run = ResearchRun(OllamaLLM(), tools, depth=args.depth, on_event=print_event)
+        run = ResearchRun(OllamaLLM(), tools, depth=args.depth, on_event=print_event, review=not args.no_review)
         result = run.run(args.question)
     except (LLMConnectionError, LLMError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)

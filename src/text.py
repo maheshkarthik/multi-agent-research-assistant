@@ -55,3 +55,8 @@ def _truncate(text: str, limit: int) -> str:
     cut = text[:limit]
     space = cut.rfind(" ")
     return (cut[:space] if space > limit * 0.8 else cut).rstrip() + " ..."
+
+
+def count(n: int, noun: str) -> str:
+    """``count(1, "finding")`` -> "1 finding", ``count(2, "finding")`` -> "2 findings"."""
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"

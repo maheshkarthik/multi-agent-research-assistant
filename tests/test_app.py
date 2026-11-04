@@ -8,7 +8,7 @@ import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 from src.llm import LLMConnectionError
-from tests.fakes import FakeLLM, FakeTool, cite_all_researcher, evidence, plan_reply
+from tests.fakes import FakeLLM, FakeTool, cite_all_researcher, conflicts_reply, evidence, plan_reply, review_reply
 
 APP = str(Path(__file__).resolve().parent.parent / "app.py")
 
@@ -47,6 +47,7 @@ class AppTests(unittest.TestCase):
         self.llm = AppLLM(
             planner=plan_reply("Why?", "How?"),
             researcher=cite_all_researcher,
+            reviewer=review_reply(),
             writer="Printing spread knowledge quickly across Europe and changed how scholars worked [1].\n\n"
                    "## Conclusion\n\nIt mattered a great deal for science and learning [2].",
         )
@@ -78,11 +79,13 @@ class AppTests(unittest.TestCase):
     def test_research_shows_linked_report_sources_and_download(self):
         at = self.research(self.app())
         self.assertFalse(at.exception)
-        self.assertEqual(self.llm.agents_called(), ["planner", "researcher", "researcher", "writer"])
+        self.assertEqual(self.llm.agents_called(), ["planner", "researcher", "researcher", "reviewer", "conflicts", "writer"])
 
         report = next(m.value for m in at.markdown if "Printing spread knowledge" in m.value)
         self.assertIn("[[1]](https://example.com/", report)  # citations link to their source
-        self.assertEqual([m.value for m in at.metric][1:], ["4", "2", "2"])  # calls, read, cited
+        self.assertEqual([m.value for m in at.metric][1:], ["6", "2", "2"])  # calls, read, cited
+        self.assertIn("Reviewer: no gaps found", [s.label for s in at.status])
+        self.assertIn("Reviewer: no conflicts", [s.label for s in at.status])
         self.assertTrue(any("Page about Why?" in m.value for m in at.markdown))
         self.assertEqual(len(at.get("download_button")), 1)
         self.assertEqual(at.status[0].label[:17], "Research complete")
@@ -119,6 +122,25 @@ class AppTests(unittest.TestCase):
         self.assertFalse(at.exception)
         labels = [s.label for s in at.status]
         self.assertIn("Researcher 2: failed", labels)
+
+    def test_reviewer_follow_ups_appear_in_timeline_and_report(self):
+        self.llm.replies["reviewer"] = review_reply("What happened next?")
+        self.llm.replies["conflicts"] = conflicts_reply((1, 3))
+        at = self.research(self.app())
+        self.assertFalse(at.exception)
+        labels = [s.label for s in at.status]
+        self.assertIn("Reviewer: 1 follow-up question", labels)
+        self.assertIn("Reviewer: 1 conflict between sources", labels)
+        self.assertIn("Researcher 3: 1 finding", labels)
+        self.assertTrue(any("Researcher 3: What happened next?" in m.value for m in at.markdown))
+        self.assertTrue(any("versus" in c.value and "They differ." in c.value for c in at.caption))
+
+    def test_reviewer_can_be_turned_off(self):
+        at = self.app()
+        at.toggle[0].set_value(False)
+        at = self.research(at)
+        self.assertFalse(at.exception)
+        self.assertNotIn("reviewer", self.llm.agents_called())
 
     def test_example_fills_the_question(self):
         at = self.app()

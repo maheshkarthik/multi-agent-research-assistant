@@ -1,9 +1,11 @@
-"""Runs the research pipeline: plan, gather evidence, research, write, check.
+"""Runs the research pipeline: plan, gather evidence, research, review, write, check.
 
 Plain Python, no agent framework:
 
     Planner ─► [gather evidence for every sub-question in parallel]
             ─► Researcher per sub-question (one model call each, in order)
+            ─► Reviewer, optional: finds gaps ─► one follow-up research round
+                                   ─► finds conflicts between sources
             ─► Writer ─► citation check
 
 Evidence gathering is network-bound, so all sub-questions are searched at once.
@@ -25,10 +27,11 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from src.agents import Findings, Plan, Planner, Researcher, SubQuestion, Writer
+from src.agents import Findings, Plan, Planner, Researcher, Review, Reviewer, SubQuestion, Writer
 from src.citations import CitationCheck, check_citations
 from src.llm import LLM, LLMConnectionError, LLMError
 from src.sources import Evidence, Source, SourceRegistry
+from src.text import count
 from src.tools import ResearchTool, ToolError
 
 logger = logging.getLogger(__name__)
@@ -40,6 +43,9 @@ NO_FINDINGS_REPORT = (
     "The research agents could not find information that answers this question in the selected sources. "
     "Try rephrasing the question, increasing the depth, or enabling another source."
 )
+
+
+NO_NEW_SOURCES = "Found no sources beyond those already read."
 
 
 @dataclass(frozen=True)
@@ -55,6 +61,10 @@ PLAN_READY = "plan_ready"
 SEARCHING = "searching"
 SOURCES_FOUND = "sources_found"
 RESEARCHER_DONE = "researcher_done"
+REVIEWING = "reviewing"
+REVIEW_DONE = "review_done"
+CHECKING_CONFLICTS = "checking_conflicts"
+CONFLICTS_DONE = "conflicts_done"
 WRITING = "writing"
 DONE = "done"
 WARNING = "warning"
@@ -73,6 +83,7 @@ class ResearchResult:
     seconds: float
     model_calls: int
     warnings: list[str] = field(default_factory=list)
+    review: Review | None = None  # None when the reviewer was off or failed
 
     @property
     def cited_sources(self) -> list[Source]:
@@ -102,6 +113,7 @@ class ResearchRun:
         depth: int = 3,
         on_event: EventHandler | None = None,
         max_sources_per_question: int = MAX_SOURCES_PER_QUESTION,
+        review: bool = False,
     ) -> None:
         if not tools:
             raise ValueError("At least one research tool is required.")
@@ -109,6 +121,7 @@ class ResearchRun:
         self.tools = tools
         self.depth = depth
         self.max_sources = max_sources_per_question
+        self.review = review
         self._on_event = on_event or (lambda event: None)
         self.registry = SourceRegistry()
         self.warnings: list[str] = []
@@ -131,19 +144,19 @@ class ResearchRun:
             self._warn("The planner could not split the question, so it was researched as a whole.")
         self._emit(PLAN_READY, f"Plan ready: {len(plan.sub_questions)} sub-questions", plan=plan)
 
-        all_findings: list[Findings] = []
-        researcher = Researcher(self.llm)
-        with ThreadPoolExecutor(max_workers=GATHER_WORKERS) as pool:
-            futures = {sq.number: pool.submit(self._gather, sq) for sq in plan.sub_questions}
-            for sq in plan.sub_questions:
-                self._emit(SEARCHING, f"Searching for sub-question {sq.number}", sub_question=sq)
-            for sq in plan.sub_questions:
-                all_findings.append(self._research(researcher, sq, futures[sq.number]))
+        all_findings = self._research_round(plan.sub_questions)
+        review = None
+        if self.review:
+            follow_ups = self._find_gaps(question, all_findings)
+            if follow_ups:
+                all_findings += self._research_round(follow_ups, already_read={s.id for s in self.registry.all()})
+            review = Review(follow_ups, self._find_conflicts(question, all_findings))
 
         if any(f.findings for f in all_findings):
             self._emit(WRITING, "Writing the report")
             try:
-                report = Writer(self.llm).run(question, all_findings)
+                useful = [f for f in all_findings if f.findings or not f.sub_question.follow_up]
+                report = Writer(self.llm).run(question, useful, review.conflicts if review else [])
             except LLMConnectionError:
                 raise
             except LLMError as exc:
@@ -167,11 +180,55 @@ class ResearchRun:
             seconds=time.monotonic() - started,
             model_calls=_model_calls(self.llm) - calls_before,
             warnings=list(self.warnings),
+            review=review,
         )
         self._emit(DONE, f"Done in {result.seconds:.0f} s", result=result)
         return result
 
     # -------------------------------------------------------------- steps
+
+    def _research_round(self, sub_questions: list[SubQuestion], already_read: set[int] = frozenset()) -> list[Findings]:
+        """Search for every sub-question at once, then run the researchers one by one.
+
+        A sub-question whose sources were all in ``already_read`` gets no model call:
+        its researcher would only repeat findings from the earlier round.
+        """
+        researcher = Researcher(self.llm)
+        with ThreadPoolExecutor(max_workers=GATHER_WORKERS) as pool:
+            futures = {sq.number: pool.submit(self._gather, sq) for sq in sub_questions}
+            for sq in sub_questions:
+                self._emit(SEARCHING, f"Searching for sub-question {sq.number}", sub_question=sq)
+            return [self._research(researcher, sq, futures[sq.number], already_read) for sq in sub_questions]
+
+    def _find_gaps(self, question: str, all_findings: list[Findings]) -> list[SubQuestion]:
+        """Ask the reviewer what is missing. A failed check is skipped, not fatal."""
+        self._emit(REVIEWING, "Reviewing the findings for gaps")
+        try:
+            follow_ups = Reviewer(self.llm).find_gaps(question, all_findings)
+        except LLMConnectionError:
+            raise
+        except LLMError as exc:
+            self._warn(f"The reviewer failed to check for gaps ({exc}); continuing without follow-ups.")
+            self._emit(REVIEW_DONE, "Gap check skipped", follow_ups=None)
+            return []
+        message = f"Review: {count(len(follow_ups), 'follow-up question')}" if follow_ups else "Review: no gaps found"
+        self._emit(REVIEW_DONE, message, follow_ups=follow_ups)
+        return follow_ups
+
+    def _find_conflicts(self, question: str, all_findings: list[Findings]) -> list[str]:
+        """Ask the reviewer which findings disagree. A failed check is skipped, not fatal."""
+        self._emit(CHECKING_CONFLICTS, "Checking the findings for conflicts")
+        try:
+            conflicts = Reviewer(self.llm).find_conflicts(question, all_findings)
+        except LLMConnectionError:
+            raise
+        except LLMError as exc:
+            self._warn(f"The reviewer failed to check for conflicts ({exc}); continuing without.")
+            self._emit(CONFLICTS_DONE, "Conflict check skipped", conflicts=None)
+            return []
+        message = f"Review: {count(len(conflicts), 'conflict')} between sources" if conflicts else "Review: no conflicts"
+        self._emit(CONFLICTS_DONE, message, conflicts=conflicts)
+        return conflicts
 
     def _gather(self, sq: SubQuestion) -> tuple[list[list[Evidence]], list[str]]:
         """Run every tool for one sub-question. Runs on a search thread, so it doesn't emit events."""
@@ -198,14 +255,17 @@ class ResearchRun:
                 unique.append(source)
         return unique
 
-    def _research(self, researcher: Researcher, sq: SubQuestion, gathered: Future) -> Findings:
+    def _research(self, researcher: Researcher, sq: SubQuestion, gathered: Future, already_read: set[int]) -> Findings:
         per_tool, warnings = gathered.result()  # _gather never raises
         for warning in warnings:
             self._warn(warning)
         sources = self._register(per_tool)
         self._emit(SOURCES_FOUND, f"Sub-question {sq.number}: {len(sources)} sources", sub_question=sq, sources=sources)
         try:
-            findings = researcher.run(sq, sources)
+            if sources and all(s.id in already_read for s in sources):
+                findings = Findings(sub_question=sq, sources=sources, gaps=NO_NEW_SOURCES)
+            else:
+                findings = researcher.run(sq, sources)
         except LLMConnectionError:
             raise
         except LLMError as exc:
@@ -217,7 +277,7 @@ class ResearchRun:
             )
         self._emit(
             RESEARCHER_DONE,
-            f"Sub-question {sq.number}: {len(findings.findings)} findings",
+            f"Sub-question {sq.number}: {count(len(findings.findings), 'finding')}",
             sub_question=sq,
             findings=findings,
         )

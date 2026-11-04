@@ -34,6 +34,31 @@ class ParseJsonTests(unittest.TestCase):
             parse_json_object('{"a": }')
 
 
+class OllamaErrorTests(unittest.TestCase):
+    def call_with(self, error):
+        from unittest import mock
+
+        from src.llm import OllamaLLM
+
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            OllamaLLM(timeout=1).generate("system", "user")
+
+    def test_timeout_is_not_a_connection_error(self):
+        from src.llm import LLMConnectionError, LLMTimeoutError
+
+        with self.assertRaises(LLMTimeoutError) as caught:
+            self.call_with(TimeoutError("timed out"))
+        self.assertNotIsInstance(caught.exception, LLMConnectionError)
+
+    def test_refused_connection_is_a_connection_error(self):
+        import urllib.error
+
+        from src.llm import LLMConnectionError
+
+        with self.assertRaises(LLMConnectionError):
+            self.call_with(urllib.error.URLError(ConnectionRefusedError()))
+
+
 class ExcerptTests(unittest.TestCase):
     def test_short_text_is_returned_unchanged(self):
         self.assertEqual(best_excerpt("Short text.", "anything"), "Short text.")
